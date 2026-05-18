@@ -92,6 +92,15 @@ dcgmm <- function( x, p ) {
     return( sum )
 }
 
+dsnmm <- function( x, p ) {
+    P = matrix( p, ncol = 4 )
+    y = numeric( length(x) )
+    for (i in 1:nrow(P)) {
+        y = y + P[i,1] * dsn( x, P[i,2], P[i,3], P[i,4] )
+    }
+    return (y)
+}
+
 llgmm <- function( x, p, implementation = "C" ) {
     if( length( p[is.na(p)] ) > 0 ) {
         return( NaN )
@@ -197,7 +206,17 @@ llcmm <- function( x, p, implementation = "C" ) {
     }
 }
 
-gmm_fit_em <- function( x, p, w = numeric(), epsilon = c( 0.000001, 0.000001, 0.000001 ),
+llsnmm <- function( x, p ) {
+    m = length(p)/4
+
+    y = numeric( length(x) )
+    for (i in 1:m) {
+        y = y + p[i] * dsn(x, p[m+i], p[2*m+i], p[3*m+i])
+    }
+    return( sum( log( y ) ) )
+}
+
+gmm_fit_em <- function( x, p, w = numeric(), epsilon = c( 0.000001, 0.000001, 0.000001 ), max_steps = 0,
                         debug = FALSE, implementation = "C", ... ) {
     if( length(w) != length(x) ) {
         w = x * 0 + 1
@@ -212,6 +231,7 @@ gmm_fit_em <- function( x, p, w = numeric(), epsilon = c( 0.000001, 0.000001, 0.
                   as.integer( length(p) ),
                   as.double(w),
                   as.double( epsilon ),
+                  as.integer( max_steps ),
                   as.integer( debug ),
                   retvec = numeric( length(p) ),
                   steps = integer(1) )
@@ -832,6 +852,12 @@ llgmm_opposite <- function( x, p ) {
 
 llvmm_opposite <- function( x, p ) {
     return( -llvmm( x, p ) )
+}
+
+# Calculate Akaike Information Criterion (AIC) for any type of mixture
+# model. Log-likelihood function has to be provided.
+aic <- function( x, p, llf ) {
+    return( -2 * llf( x, p ) + 2 * (length( p ) - 1) )
 }
 
 # Calculate Bayesian Information Criterion (BIC) for any type of mixture
@@ -1504,6 +1530,102 @@ s_fit_primitive <- function( x ) {
     return( c( xbar, alpha, ni ) )
 }
 
+# According to https://www3.stat.sinica.edu.tw/statistica/oldpdf/A17n35.pdf
+snmm_fit_em <- function(x, p, w = numeric(), epsilon = c( 1e-6, 1e-6, 1e-6, 1e-6 )) {
+    if( length(w) != length(x) ) {
+        w = rep( 1,  length(x) )
+    }
+
+    m = length(p) / 4
+    omega  = p[1:m]
+    dzeta  = p[(m+1):(2*m)]
+    sigma  = p[(2*m+1):(3*m)]
+    lambda = p[(3*m+1):(4*m)]
+
+    run = TRUE
+    while( run ) {
+        prev_omega  = omega
+        prev_dzeta  = dzeta
+        prev_sigma  = sigma
+        prev_lambda = lambda
+
+        # (12)
+        z = matrix( nrow = m, ncol = length(x) )
+        zsum = numeric( length = length(x) )
+        for (i in 1:m) {
+            z[i,] = omega[i] * dsn(x, dzeta[i], sigma[i], lambda[i])
+            zsum = zsum + z[i,]
+        }
+        for (i in 1:m) {
+            z[i,] = w * z[i,] / zsum
+        }
+        z[is.na(z) | z < 1e-300] = 0 # Assign weight of 0 to unimportant observations
+
+        # (13) and (14)
+        muT = matrix( nrow = m, ncol = length(x) )
+        for (i in 1:m) {
+            muT[i,] = sn_delta(lambda[i]) * (x - dzeta[i])
+        }
+        s1 = matrix( nrow = m, ncol = length(x) )
+        s2 = matrix( nrow = m, ncol = length(x) )
+        for (i in 1:m) {
+            sigmaT = sigma[i] * sqrt( 1 - sn_delta(lambda[i]) ^ 2 )
+            arg = lambda[i] * (x - dzeta[i]) / sigma[i]
+            s1[i,] = z[i,] * (muT[i,] + sigmaT * dnorm(arg) / pnorm(arg))
+            s2[i,] = z[i,] * (muT[i,]^2 + sigmaT^2 + dnorm(arg) / pnorm(arg) * muT[i,] * sigmaT)
+            # The following NA values appear due to 0 (weight) * Inf (value with cdf = 0)
+            s1[i,is.na(s1[i,])] = 0
+            s2[i,is.na(s2[i,])] = 0
+        }
+
+        # CM-step 1
+        for (i in 1:m) {
+            omega[i] = sum(z[i,]) / sum(w)
+        }
+
+        # CM-step 2
+        for (i in 1:m) {
+            dzeta[i] = (sum(z[i,] * x) - sn_delta(lambda[i]) * sum(s1[i,])) / sum(z[i,])
+        }
+
+        # CM-step 3
+        for (i in 1:m) {
+            sigma[i] = sqrt((sum(s2[i,]) - 2 * sn_delta(lambda[i]) * sum(s1[i,] * (x - dzeta[i])) + sum(z[i,] * (x - dzeta[i]) ^ 2)) / (2 * (1 - sn_delta(lambda[i]) ^ 2) * sum(z[i,])))
+        }
+
+        # CM-step 4
+        for (i in 1:m) {
+            a = sigma[i] ^ 2 * sum(z[i,])
+            b = sum((x - dzeta[i]) * s1[i,])
+            c = sum(s2[i,])
+            d = sum(z[i,] * (x - dzeta[i]) ^ 2)
+            roots_orig = polyroot( c( b, a - c - d, b, -a ) ) # a root must have absolute value < 1
+            roots = roots_orig[abs(Im(roots_orig)) < 1e-6 & abs(Re(roots_orig)) < 1]
+            if( length(roots) == 0 ) {
+                stop( "no roots found" )
+            }
+            root = Re(roots[1])
+            lambda[i] = sign(root) * sqrt( (root ^ 2) / (1 - root ^ 2) )
+        }
+
+        # Order the model's components by their location
+        omega  = omega[order(dzeta)]
+        sigma  = sigma[order(dzeta)]
+        lambda = lambda[order(dzeta)]
+        dzeta  = dzeta[order(dzeta)]
+
+        if( all( !is.na( c( omega, sigma, lambda, dzeta ) ) ) &&
+            all( abs( omega  - prev_omega  ) < epsilon[1] ) &&
+            all( abs( dzeta  - prev_dzeta  ) < epsilon[2] ) &&
+            all( abs( sigma  - prev_sigma  ) < epsilon[3] ) &&
+            all( abs( lambda - prev_lambda ) < epsilon[4] ) ) {
+            run = FALSE
+        }
+    }
+
+    return( c(omega, dzeta, sigma, lambda) )
+}
+
 mk_fit_images <- function( h, l, prefix = "img_" ) {
     maxstrlen = ceiling( log( length( l ) ) / log( 10 ) )
     for( i in 1:length( l ) ) {
@@ -1606,6 +1728,55 @@ smm_init_vector_kmeans <- function( x, m ) {
         }
     }
     return( start )
+}
+
+# Cubic root in R. Somewhat complicated.
+curt <- function( x ) {
+    return( sign(x) * abs(x) ^ (1/3) )
+}
+
+snmm_init_vector <- function( x, n = 1 ) {
+    if (n == 1) {
+        a1 = sqrt( 2 / pi )
+        b1 = (4 / pi - 1) * a1
+        m1 = mean(x)
+        m2 = sum((x - m1)^2) / (length(x) - 1)
+        m3 = sum((x - m1)^3) / (length(x) - 1)
+
+        # Equation 3 from Lin et al. (2007)
+        dzeta = m1 - a1 * curt(m3 / b1)
+        sigma = sqrt(m2 + a1 ^ 2 * curt(m3 / b1) ^ 2)
+
+        # Equation 18c of Arnold et al. (1993)
+        p = sign(m3) / sqrt( a1 ^ 2 + m2 * curt(b1 / m3) ^ 2 )
+
+        # A trick to select a reasonable lambda value is p becomes out of bounds
+        lambda = m3
+        if (abs(p) < 1) {
+            lambda = p / sqrt( 1 - p^2 )
+        }
+
+        return( c( 1, dzeta, sigma, lambda ) )
+    } else {
+        k = kmeans( x, n )
+
+        p = numeric( n * 4 )
+        p[1:n] = k$size / length( x )
+        for (i in 1:n) {
+            ret = snmm_init_vector( x[k$cluster == i] )
+            p[n+i]   = ret[2]
+            p[2*n+i] = ret[3]
+            p[3*n+i] = ret[4]
+        }
+
+        # Order the model's components by their location
+        p[1:n]           = p[order(p[(n+1):(2*n)])]
+        p[(2*n+1):(3*n)] = p[order(p[(n+1):(2*n)]) + 2*n]
+        p[(3*n+1):(4*n)] = p[order(p[(n+1):(2*n)]) + 3*n]
+        p[(n+1):(2*n)]   = p[order(p[(n+1):(2*n)]) + n]
+
+        return( p )
+    }
 }
 
 gmm_merge_components <- function( x, p, i, j ) {
@@ -1750,6 +1921,8 @@ digamma_approx <- function( x ) {
 
     return( ret )
 }
+
+sn_delta <- function(x) { return( x / sqrt( 1 + x * x ) ) }
 
 # Kullback--Leibler divergence, using Dirac's delta function, implemented
 # according to:

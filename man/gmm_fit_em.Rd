@@ -7,7 +7,7 @@
 }
 \usage{
     gmm_fit_em( x, p, w = numeric(), epsilon = c( 0.000001, 0.000001, 0.000001 ),
-                debug = FALSE, implementation = "C", ... )
+                max_steps = 0, debug = FALSE, implementation = "C", ... )
 }
 \arguments{
     \item{x}{data vector}
@@ -30,6 +30,9 @@
         epsilon_A is threshold for component proportions,
         epsilon_mu is threshold for component centers and
         epsilon_sigma is threshold for component scales.
+    }
+    \item{max_steps}{
+        maximum number of steps (0 = no limit).
     }
     \item{debug}{
         flag to turn the debug prints on/off.
